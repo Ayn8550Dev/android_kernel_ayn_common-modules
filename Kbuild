@@ -31,3 +31,7 @@ EXTRA_CFLAGS += -Wheader-guard
 endif
 
 ######### CONFIG_MSM_MOORECHIP ########
+
+ifeq ($(CONFIG_LEDS_SN3112), y)
+	obj-$(CONFIG_MSM_MOORECHIP) += leds-sn3112.o
+endif
