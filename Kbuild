@@ -35,3 +35,7 @@ endif
 ifeq ($(CONFIG_LEDS_SN3112), y)
 	obj-$(CONFIG_MSM_MOORECHIP) += leds-sn3112.o
 endif
+
+ifeq ($(CONFIG_LEDS_HTR3212), y)
+	obj-$(CONFIG_MSM_MOORECHIP) += leds-htr3212.o
+endif
