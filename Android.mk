@@ -71,5 +71,16 @@ ifeq ($(MOORECHIP_DLKM_ENABLE),  true)
         include $(DLKM_DIR)/Build_external_kernelmodule.mk
         ###########################################################
 
+       ###########################################################
+        include $(CLEAR_VARS)
+        LOCAL_SRC_FILES   := $(wildcard $(LOCAL_PATH)/**/*) $(wildcard $(LOCAL_PATH)/*)
+        LOCAL_MODULE              := focaltech_fp.ko
+        LOCAL_MODULE_KBUILD_NAME  := focaltech_fp.ko
+        LOCAL_MODULE_TAGS         := optional
+        #LOCAL_MODULE_DEBUG_ENABLE := true
+        LOCAL_MODULE_PATH         := $(KERNEL_MODULES_OUT)
+        include $(DLKM_DIR)/Build_external_kernelmodule.mk
+        ###########################################################
+
        endif # DLKM check
 endif
