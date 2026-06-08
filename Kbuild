@@ -43,3 +43,21 @@ endif
 ifeq ($(CONFIG_JOYSTICK_MOORECHIP_JOYSTICK), y)
 	obj-$(CONFIG_MSM_MOORECHIP) += moorechip-joystick.o
 endif
+
+ifeq ($(CONFIG_FINGERPRINT_FOCALTECH), y)
+	LINUX_INC += -include $(MOORECHIP_ROOT)/focaltech_fp/ff_core.h
+	LINUX_INC += -include $(MOORECHIP_ROOT)/focaltech_fp/ff_log.h
+	LINUX_INC += -include $(MOORECHIP_ROOT)/focaltech_fp/ff_spi.h
+
+	CONFIG_FINGERPRINT_FOCALTECH_TEE_REE := y
+
+	focaltech_fp-y := ./focaltech_fp/ff_core.o
+
+	ifeq ($(CONFIG_FINGERPRINT_FOCALTECH_TEE_REE),y)
+		ccflags-y += -DCONFIG_FINGERPRINT_FOCALTECH_TEE_REE
+		ccflags-y += -DCONFIG_FINGERPRINT_FOCALTECH_SPI_SUPPORT
+		focaltech_fp-y += ./focaltech_fp/ff_spi.o ./focaltech_fp/ff_chip.o
+	endif
+
+	obj-$(CONFIG_MSM_MOORECHIP) += focaltech_fp.o
+endif
