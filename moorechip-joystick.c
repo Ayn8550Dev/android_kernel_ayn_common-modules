@@ -106,6 +106,12 @@ enum moorechip_ignore_extra {
 	MOORECHIP_IGNORE_RIGHT_STICK = (1 << 19),
 };
 
+enum moorechip_trigger_mode {
+	MOORECHIP_TRIGGER_MODE_DIGITAL = (1 << 0),
+	MOORECHIP_TRIGGER_MODE_ANALOG = (1 << 1),
+	MOORECHIP_TRIGGER_MODE_BOTH = MOORECHIP_TRIGGER_MODE_DIGITAL | MOORECHIP_TRIGGER_MODE_ANALOG
+};
+
 struct moorechip_key_data {
 	u16 keys;
 	u16 left_trigger;
@@ -141,7 +147,7 @@ struct moorechip_driver {
 	int boot_gpio;
 	int reset_gpio;
 	bool layout_xbox;
-	bool digital_triggers;
+	enum moorechip_trigger_mode trigger_mode;
 	u8 seq;
 	struct moorechip_key_data last_keys;
 	struct moorechip_stick_calib calib_stick_left;
@@ -589,14 +595,15 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 				input_report_key(moorechip->input, KEY_BACK, !!(keys & MOORECHIP_BTN_BACK));
 
 			if (!(moorechip->ignore_mask & MOORECHIP_IGNORE_LEFT_TRIGGER)) {
-				if (moorechip->digital_triggers) {
+				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_DIGITAL) {
 					bool last_active = moorechip_map_trigger_val(&moorechip->calib_trigger_left, last_keys->left_trigger) >
 						MOORECHIP_MAX_TRIGGER_MAG / 2;
 					bool now_active = moorechip_map_trigger_val(&moorechip->calib_trigger_left, key_data->left_trigger) >
 						MOORECHIP_MAX_TRIGGER_MAG / 2;
 					if (last_active != now_active)
 						input_report_key(moorechip->input, BTN_TL2, now_active);
-				} else {
+				}
+				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_ANALOG) {
 					if (last_keys->left_trigger != key_data->left_trigger)
 						input_report_abs(moorechip->input, ABS_Z,
 							moorechip_map_trigger_val(&moorechip->calib_trigger_left, key_data->left_trigger));
@@ -604,14 +611,15 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 			}
 
 			if (!(moorechip->ignore_mask & MOORECHIP_IGNORE_RIGHT_TRIGGER)) {
-				if (moorechip->digital_triggers) {
+				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_DIGITAL) {
 					bool last_active = moorechip_map_trigger_val(&moorechip->calib_trigger_right, last_keys->right_trigger) >
 						MOORECHIP_MAX_TRIGGER_MAG / 2;
 					bool now_active = moorechip_map_trigger_val(&moorechip->calib_trigger_right, key_data->right_trigger) >
 						MOORECHIP_MAX_TRIGGER_MAG / 2;
 					if (last_active != now_active)
 						input_report_key(moorechip->input, BTN_TR2, now_active);
-				} else {
+				}
+				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_ANALOG) {
 					if (last_keys->right_trigger != key_data->right_trigger)
 						input_report_abs(moorechip->input, ABS_RZ,
 							moorechip_map_trigger_val(&moorechip->calib_trigger_right, key_data->right_trigger));
@@ -729,7 +737,7 @@ static int moorechip_joystick_register_input(struct moorechip_driver *moorechip)
 	input_set_capability(moorechip->input, EV_KEY, BTN_TL2);
 	input_set_capability(moorechip->input, EV_KEY, BTN_TR2);
 
-	if (!moorechip->digital_triggers) {
+	if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_ANALOG) {
 		input_set_abs_params(moorechip->input, ABS_Z,
 				     0, MOORECHIP_MAX_TRIGGER_MAG, 0, 0);
 		input_set_abs_params(moorechip->input, ABS_RZ,
@@ -921,9 +929,11 @@ static ssize_t set_triggers(struct device *dev, struct device_attribute *attr,
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
 
 	if (sysfs_streq("digital", buf))
-		moorechip->digital_triggers = true;
+		moorechip->trigger_mode = MOORECHIP_TRIGGER_MODE_DIGITAL;
 	else if (sysfs_streq("analog", buf))
-		moorechip->digital_triggers = false;
+		moorechip->trigger_mode = MOORECHIP_TRIGGER_MODE_ANALOG;
+	else if (sysfs_streq("both", buf))
+		moorechip->trigger_mode = MOORECHIP_TRIGGER_MODE_BOTH;
 	else
 		return -EINVAL;
 
@@ -937,10 +947,15 @@ static ssize_t get_triggers(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
-	if (moorechip->digital_triggers)
+	switch (moorechip->trigger_mode) {
+	case MOORECHIP_TRIGGER_MODE_DIGITAL:
 		return sysfs_emit(buf, "digital\n");
-	else
+	case MOORECHIP_TRIGGER_MODE_ANALOG:
 		return sysfs_emit(buf, "analog\n");
+	case MOORECHIP_TRIGGER_MODE_BOTH:
+		return sysfs_emit(buf, "both\n");
+	}
+	return sysfs_emit(buf, "unknown\n");
 }
 static DEVICE_ATTR(triggers, 0644, get_triggers, set_triggers);
 
