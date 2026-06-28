@@ -555,14 +555,14 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 			keys = key_data->keys;
 			changed_keys = (last_keys->keys ^ keys) & ~moorechip->ignore_mask;
 
-			if (changed_keys & (MOORECHIP_BTN_LEFT | MOORECHIP_BTN_RIGHT)) {
-			        int hat_x = (keys & MOORECHIP_BTN_RIGHT) ? 1 : ((keys & MOORECHIP_BTN_LEFT) ? -1 : 0);
-			        input_report_abs(moorechip->input, ABS_HAT0X, hat_x);
-			}
-			if (changed_keys & (MOORECHIP_BTN_UP | MOORECHIP_BTN_DOWN)) {
-			        int hat_y = (keys & MOORECHIP_BTN_DOWN) ? 1 : ((keys & MOORECHIP_BTN_UP) ? -1 : 0);
-			        input_report_abs(moorechip->input, ABS_HAT0Y, hat_y);
-			}
+			if (changed_keys & MOORECHIP_BTN_UP)
+				input_report_abs(moorechip->input, ABS_HAT0Y, -(!!(keys & MOORECHIP_BTN_UP)));
+			if (changed_keys & MOORECHIP_BTN_DOWN)
+				input_report_abs(moorechip->input, ABS_HAT0Y, !!(keys & MOORECHIP_BTN_DOWN));
+			if (changed_keys & MOORECHIP_BTN_LEFT)
+				input_report_abs(moorechip->input, ABS_HAT0X, -(!!(keys & MOORECHIP_BTN_LEFT)));
+			if (changed_keys & MOORECHIP_BTN_RIGHT)
+				input_report_abs(moorechip->input, ABS_HAT0X, !!(keys & MOORECHIP_BTN_RIGHT));
 			if (changed_keys & MOORECHIP_BTN_X)
 				input_report_key(moorechip->input, moorechip->layout_xbox ? BTN_WEST : BTN_NORTH, !!(keys & MOORECHIP_BTN_X));
 			if (changed_keys & MOORECHIP_BTN_Y)
@@ -639,11 +639,28 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 	}
 
 	return packetlen;
-};
+}
 
-static void moorechip_report_mapped_input(struct moorechip_driver *moorechip,
-					  u32 code, bool pressed)
+static irqreturn_t moorechip_gpio_isr(int irq, void *dev_id)
 {
+	struct moorechip_driver *moorechip = dev_id;
+	struct gpio_desc *key;
+	u32 code;
+
+	if (!moorechip->input)
+		return IRQ_HANDLED;
+
+	if (irq == moorechip->m0_irq) {
+		code = moorechip->m0_code;
+		key = moorechip->m0_key;
+	} else {
+		code = moorechip->m1_code;
+		key = moorechip->m1_key;
+	}
+
+	if (code == KEY_RESERVED)
+		return IRQ_HANDLED;
+
 	if (code == BTN_WEST)
 		code = moorechip->layout_xbox ? BTN_WEST : BTN_NORTH;
 	else if (code == BTN_NORTH)
@@ -655,43 +672,24 @@ static void moorechip_report_mapped_input(struct moorechip_driver *moorechip,
 
 	switch (code) {
 	case BTN_DPAD_LEFT:
-		input_report_abs(moorechip->input, ABS_HAT0X, pressed ? -1 : 0);
+		input_report_abs(moorechip->input, ABS_HAT0X, -gpiod_get_value_cansleep(key));
 		break;
 
 	case BTN_DPAD_RIGHT:
-		input_report_abs(moorechip->input, ABS_HAT0X, pressed ? 1 : 0);
+		input_report_abs(moorechip->input, ABS_HAT0X, gpiod_get_value_cansleep(key));
 		break;
 
 	case BTN_DPAD_UP:
-		input_report_abs(moorechip->input, ABS_HAT0Y, pressed ? -1 : 0);
+		input_report_abs(moorechip->input, ABS_HAT0Y, -gpiod_get_value_cansleep(key));
 		break;
 
 	case BTN_DPAD_DOWN:
-		input_report_abs(moorechip->input, ABS_HAT0Y, pressed ? 1 : 0);
+		input_report_abs(moorechip->input, ABS_HAT0Y, gpiod_get_value_cansleep(key));
 		break;
 
 	default:
-		input_report_key(moorechip->input, code, pressed);
+		input_report_key(moorechip->input, code, gpiod_get_value_cansleep(key));
 	}
-}
-
-static irqreturn_t moorechip_gpio_isr(int irq, void *dev_id)
-{
-	struct moorechip_driver *moorechip = dev_id;
-	struct gpio_desc *key;
-	bool pressed;
-	u32 code;
-
-	if (irq == moorechip->m0_irq) {
-		code = moorechip->m0_code;
-		key = moorechip->m0_key;
-	} else {
-		code = moorechip->m1_code;
-		key = moorechip->m1_key;
-	}
-
-	pressed = gpiod_get_value_cansleep(key);
-	moorechip_report_mapped_input(moorechip, code, pressed);
 
 	input_sync(moorechip->input);
 
@@ -978,7 +976,7 @@ static const struct {
 	const char *name;
 	u32 code;
 } moorechip_function_map[] = {
-	{ "none",   0 },
+	{ "none",   KEY_RESERVED },
 	{ "home",   BTN_MODE },
 	{ "select", BTN_SELECT },
 	{ "start",  BTN_START },
@@ -1107,9 +1105,11 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	moorechip->calib_trigger_left.max = 1900;
 	moorechip->calib_trigger_right.min = 0;
 	moorechip->calib_trigger_right.max = 1900;
-	moorechip->digital_triggers = false;
+	moorechip->trigger_mode = MOORECHIP_TRIGGER_MODE_BOTH;
 	moorechip->ignore_mask = 0;
 	moorechip->fw = NULL;
+	moorechip->m0_code = KEY_RESERVED;
+	moorechip->m1_code = KEY_RESERVED;
 
 	moorechip->vdd_reg = devm_regulator_get(dev, "vdd");
 	if (IS_ERR(moorechip->vdd_reg)) {
@@ -1177,8 +1177,6 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 			dev_err(dev, "Unable to claim m0 key irq: %d\n", ret);
 			goto err;
 		}
-
-		moorechip->m0_code = 0;
 	}
 
 	moorechip->m1_key = devm_gpiod_get(dev, "m1_key", GPIOD_IN);
@@ -1203,8 +1201,6 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 			dev_err(dev, "Unable to claim m1 key irq: %d\n", ret);
 			goto err;
 		}
-
-		moorechip->m1_code = 0;
 	}
 
 	ret = serdev_device_open(serdev);
