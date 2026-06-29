@@ -447,9 +447,9 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 						release_firmware(ver);
 
 						dev_info(dev, "Version mismatch. Upgrading the firmware.\n");
-
-						moorechip_upgrade_start(moorechip);
 					}
+
+					moorechip_upgrade_start(moorechip);
 
 					rc = request_firmware(&moorechip->fw, "mcuapp_firmware.bin", dev);
 					if (rc < 0) {
