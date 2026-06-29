@@ -137,6 +137,7 @@ struct moorechip_stick_calib {
 struct moorechip_trigger_calib {
 	int min;
 	int max;
+	uint8_t digital_threshold;
 };
 
 struct moorechip_driver {
@@ -597,9 +598,9 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 			if (!(moorechip->ignore_mask & MOORECHIP_IGNORE_LEFT_TRIGGER)) {
 				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_DIGITAL) {
 					bool last_active = moorechip_map_trigger_val(&moorechip->calib_trigger_left, last_keys->left_trigger) >
-						MOORECHIP_MAX_TRIGGER_MAG / 2;
+						moorechip->calib_trigger_left.digital_threshold;
 					bool now_active = moorechip_map_trigger_val(&moorechip->calib_trigger_left, key_data->left_trigger) >
-						MOORECHIP_MAX_TRIGGER_MAG / 2;
+						moorechip->calib_trigger_left.digital_threshold;
 					if (last_active != now_active)
 						input_report_key(moorechip->input, BTN_TL2, now_active);
 				}
@@ -613,9 +614,9 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 			if (!(moorechip->ignore_mask & MOORECHIP_IGNORE_RIGHT_TRIGGER)) {
 				if (moorechip->trigger_mode & MOORECHIP_TRIGGER_MODE_DIGITAL) {
 					bool last_active = moorechip_map_trigger_val(&moorechip->calib_trigger_right, last_keys->right_trigger) >
-						MOORECHIP_MAX_TRIGGER_MAG / 2;
+						moorechip->calib_trigger_right.digital_threshold;
 					bool now_active = moorechip_map_trigger_val(&moorechip->calib_trigger_right, key_data->right_trigger) >
-						MOORECHIP_MAX_TRIGGER_MAG / 2;
+						moorechip->calib_trigger_right.digital_threshold;
 					if (last_active != now_active)
 						input_report_key(moorechip->input, BTN_TR2, now_active);
 				}
@@ -761,7 +762,7 @@ static int moorechip_joystick_register_input(struct moorechip_driver *moorechip)
 	return input_register_device(moorechip->input);
 }
 
-#define MOORECHIP_CALIB_NUM_FIELDS 20
+#define MOORECHIP_CALIB_NUM_FIELDS 22
 
 static bool moorechip_abs_calib_valid(const struct moorechip_abs_calib *cal)
 {
@@ -783,7 +784,7 @@ static bool moorechip_stick_calib_valid(const struct moorechip_stick_calib *cal)
 
 static bool moorechip_trigger_calib_valid(const struct moorechip_trigger_calib *cal)
 {
-	return cal->max > cal->min;
+	return cal->max > cal->min && cal->digital_threshold >= 0 && cal->digital_threshold <= MOORECHIP_MAX_TRIGGER_MAG;
 }
 
 static ssize_t set_calibration(struct device *dev,
@@ -833,8 +834,10 @@ static ssize_t set_calibration(struct device *dev,
 	stick_right.y.deadzone = vals[15];
 	trigger_left.min = vals[16];
 	trigger_left.max = vals[17];
-	trigger_right.min = vals[18];
-	trigger_right.max = vals[19];
+	trigger_left.digital_threshold = vals[18];
+	trigger_right.min = vals[19];
+	trigger_right.max = vals[20];
+	trigger_right.digital_threshold = vals[21];
 
 	if (!moorechip_stick_calib_valid(&stick_left) ||
 	    !moorechip_stick_calib_valid(&stick_right) ||
@@ -856,7 +859,7 @@ static ssize_t get_calibration(struct device *dev,
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf,
-			"%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d\n",
+			"%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d\n",
 			moorechip->calib_stick_left.x.min,
 			moorechip->calib_stick_left.x.max,
 			moorechip->calib_stick_left.x.center,
@@ -875,8 +878,10 @@ static ssize_t get_calibration(struct device *dev,
 			moorechip->calib_stick_right.y.deadzone,
 			moorechip->calib_trigger_left.min,
 			moorechip->calib_trigger_left.max,
+			moorechip->calib_trigger_left.digital_threshold,
 			moorechip->calib_trigger_right.min,
-			moorechip->calib_trigger_right.max);
+			moorechip->calib_trigger_right.max,
+			moorechip->calib_trigger_right.digital_threshold);
 }
 static DEVICE_ATTR(calibration, 0644, get_calibration, set_calibration);
 
@@ -1118,8 +1123,10 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	moorechip->calib_stick_right.y.center = 0;
 	moorechip->calib_trigger_left.min = 0;
 	moorechip->calib_trigger_left.max = 1900;
+	moorechip->calib_trigger_left.digital_threshold = MOORECHIP_MAX_TRIGGER_MAG / 2;
 	moorechip->calib_trigger_right.min = 0;
 	moorechip->calib_trigger_right.max = 1900;
+	moorechip->calib_trigger_right.digital_threshold = MOORECHIP_MAX_TRIGGER_MAG / 2;
 	moorechip->trigger_mode = MOORECHIP_TRIGGER_MODE_BOTH;
 	moorechip->ignore_mask = 0;
 	moorechip->fw = NULL;
