@@ -12,6 +12,7 @@
 #include <uapi/linux/sched/types.h>
 #include <linux/firmware.h>
 #include <linux/version.h>
+#include <linux/interrupt.h>
 
 #define USB_VENDOR_ID_MICROSOFT 0x045e
 #define USB_DEVICE_ID_MICROSOFT_XBOX_360_PAD 0x028e

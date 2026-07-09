@@ -1362,7 +1362,7 @@ static int ff_probe(struct platform_device *pdev)
     init_waitqueue_head(&ff_ctx->wait_queue_head);
 
     /* Init the wake lock. */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
     wakeup_source_init(&ff_ctx->wake_lock, "ff_wake_lock");
     wakeup_source_init(&ff_ctx->wake_lock_ctl, "ff_wake_lock_ctl");
     ff_ctx->p_ws = &ff_ctx->wake_lock;
@@ -1394,7 +1394,7 @@ static int ff_probe(struct platform_device *pdev)
 
 err_init_ws:
 err_register_device:
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
     wakeup_source_trash(&ff_ctx->wake_lock);
     wakeup_source_trash(&ff_ctx->wake_lock_ctl);
     ff_ctx->p_ws = NULL;
@@ -1422,7 +1422,7 @@ static void ff_unprobe(ff_context_t *ff_ctx)
         sysfs_remove_group(&ff_ctx->pdev->dev.kobj, &ff_attrs_group);
 
         /* De-init the wake lock. */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
         wakeup_source_trash(&ff_ctx->wake_lock);
         wakeup_source_trash(&ff_ctx->wake_lock_ctl);
         ff_ctx->p_ws = NULL;
