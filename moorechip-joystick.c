@@ -13,6 +13,9 @@
 #include <linux/firmware.h>
 #include <linux/version.h>
 #include <linux/interrupt.h>
+#include <linux/mutex.h>
+#include <linux/soc/qcom/panel_event_notifier.h>
+#include <drm/drm_panel.h>
 
 #define USB_VENDOR_ID_MICROSOFT 0x045e
 #define USB_DEVICE_ID_MICROSOFT_XBOX_360_PAD 0x028e
@@ -166,19 +169,30 @@ struct moorechip_driver {
 	struct gpio_desc *m1_key;
 	int m1_irq;
 	u32 m1_code;
+	struct mutex lock;
+	void *notifier_cookie;
+	bool active;
+	bool panel_on;
+	bool system_suspended;
+	bool fw_recheck;
 };
 
 static int moorechip_send_cmd(struct moorechip_driver *moorechip, u8 type, const void *data, u16 datalen)
 {
 	struct device *dev = &moorechip->serdev->dev;
 	int packetlen = sizeof(struct moorechip_header) + datalen + 1;
-	u8 *buf = kzalloc(packetlen, GFP_KERNEL);
-	struct moorechip_header *hdr = (struct moorechip_header *)buf;
+	struct moorechip_header *hdr;
+	u8 *buf;
 	u8 checksum = 0;
 	int rc, i;
 
+	if (!READ_ONCE(moorechip->active))
+		return -EHOSTDOWN;
+
+	buf = kzalloc(packetlen, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+	hdr = (struct moorechip_header *)buf;
 
 	hdr->magic = MOORECHIP_MAGIC;
 	hdr->seq = ++moorechip->seq;
@@ -298,15 +312,23 @@ static int moorechip_upgrade_save_last_frame(struct moorechip_driver *moorechip)
 
 static int moorechip_upgrade_done(struct moorechip_driver *moorechip)
 {
-	moorechip_set_input_transmit_enabled(moorechip, true);
+	int ret;
+
+	ret = moorechip_set_input_transmit_enabled(moorechip, true);
+	if (ret)
+		return ret;
 	msleep(100);
 
-	moorechip_set_parameter(moorechip, 40, 7);
+	ret = moorechip_set_parameter(moorechip, 40, 7);
+	if (ret)
+		return ret;
 	msleep(100);
 
-	moorechip_set_input_processing_enabled(moorechip, true);
+	ret = moorechip_set_input_processing_enabled(moorechip, true);
+	if (!ret)
+		WRITE_ONCE(moorechip->fw_recheck, false);
 
-	return 0;
+	return ret;
 }
 
 static s32 moorechip_map_stick_val(struct moorechip_abs_calib *cal, s32 val)
@@ -358,6 +380,9 @@ static int moorechip_joystick_receive_buf(struct serdev_device *serdev,
 	struct moorechip_header *hdr = (struct moorechip_header *) buf;
 	u8 checksum = 0;
 	int packetlen, i;
+
+	if (!READ_ONCE(moorechip->active))
+		return len;
 
 	if (len < sizeof(struct moorechip_header) + 1) {
 		dev_dbg(dev, "Too small packet!\n");
@@ -762,6 +787,181 @@ static int moorechip_joystick_register_input(struct moorechip_driver *moorechip)
 	return input_register_device(moorechip->input);
 }
 
+static void moorechip_joystick_power_off_locked(
+		struct moorechip_driver *moorechip)
+{
+	struct device *dev = &moorechip->serdev->dev;
+	int ret;
+
+	if (!moorechip->active)
+		return;
+
+	WRITE_ONCE(moorechip->active, false);
+	serdev_device_close(moorechip->serdev);
+	if (moorechip->reset_gpio >= 0)
+		gpio_direction_output(moorechip->reset_gpio, 0);
+	if (moorechip->boot_gpio >= 0)
+		gpio_direction_output(moorechip->boot_gpio, 0);
+
+	if (moorechip->fw) {
+		release_firmware(moorechip->fw);
+		moorechip->fw = NULL;
+		moorechip->fw_sent = 0;
+		WRITE_ONCE(moorechip->fw_recheck, true);
+	}
+
+	ret = regulator_disable(moorechip->levelshifter_reg);
+	if (ret)
+		dev_warn(dev,
+			 "Failed to disable joystick levelshifter regulator: %d\n",
+			 ret);
+	ret = regulator_disable(moorechip->vdd_reg);
+	if (ret)
+		dev_warn(dev, "Failed to disable joystick vdd regulator: %d\n",
+			 ret);
+}
+
+static int moorechip_joystick_power_on_locked(
+		struct moorechip_driver *moorechip)
+{
+	struct device *dev = &moorechip->serdev->dev;
+	int ret;
+
+	if (moorechip->active || !moorechip->panel_on ||
+	    moorechip->system_suspended)
+		return 0;
+
+	if (moorechip->boot_gpio >= 0)
+		gpio_direction_output(moorechip->boot_gpio, 0);
+	if (moorechip->reset_gpio >= 0)
+		gpio_direction_output(moorechip->reset_gpio, 0);
+
+	ret = regulator_enable(moorechip->vdd_reg);
+	if (ret) {
+		dev_err(dev, "Failed to enable joystick vdd regulator: %d\n", ret);
+		return ret;
+	}
+
+	ret = regulator_enable(moorechip->levelshifter_reg);
+	if (ret) {
+		dev_err(dev,
+			"Failed to enable joystick levelshifter regulator: %d\n",
+			ret);
+		goto err_disable_vdd;
+	}
+
+	ret = serdev_device_open(moorechip->serdev);
+	if (ret) {
+		dev_err(dev, "Failed to open serdev device: %d\n", ret);
+		goto err_disable_levelshifter;
+	}
+	serdev_device_set_flow_control(moorechip->serdev, false);
+	serdev_device_set_baudrate(moorechip->serdev, 115200);
+	WRITE_ONCE(moorechip->active, true);
+
+	msleep(40);
+	if (moorechip->reset_gpio >= 0) {
+		gpio_direction_output(moorechip->reset_gpio, 1);
+		msleep(100);
+	}
+
+	ret = moorechip_set_input_transmit_enabled(moorechip, true);
+	if (ret)
+		goto err_close;
+	msleep(100);
+
+	if (READ_ONCE(moorechip->fw_recheck)) {
+		ret = moorechip_get_firmware_version(moorechip);
+	} else {
+		ret = moorechip_set_parameter(moorechip, 40, 7);
+		if (!ret) {
+			msleep(100);
+			ret = moorechip_set_input_processing_enabled(moorechip,
+							     true);
+		}
+	}
+	if (ret)
+		goto err_close;
+
+	return 0;
+
+err_close:
+	WRITE_ONCE(moorechip->active, false);
+	serdev_device_close(moorechip->serdev);
+	if (moorechip->reset_gpio >= 0)
+		gpio_direction_output(moorechip->reset_gpio, 0);
+err_disable_levelshifter:
+	regulator_disable(moorechip->levelshifter_reg);
+err_disable_vdd:
+	regulator_disable(moorechip->vdd_reg);
+	return ret;
+}
+
+static void moorechip_panel_event_notifier_callback(
+		enum panel_event_notifier_tag tag,
+		struct panel_event_notification *notification, void *data)
+{
+	struct moorechip_driver *moorechip = data;
+	int ret;
+
+	if (!notification)
+		return;
+
+	mutex_lock(&moorechip->lock);
+	switch (notification->notif_type) {
+	case DRM_PANEL_EVENT_BLANK:
+	case DRM_PANEL_EVENT_BLANK_LP:
+		if (!notification->notif_data.early_trigger)
+			break;
+		moorechip->panel_on = false;
+		moorechip_joystick_power_off_locked(moorechip);
+		break;
+	case DRM_PANEL_EVENT_UNBLANK:
+		if (notification->notif_data.early_trigger)
+			break;
+		moorechip->panel_on = true;
+		ret = moorechip_joystick_power_on_locked(moorechip);
+		if (ret)
+			dev_err(&moorechip->serdev->dev,
+				"Failed to resume joystick: %d\n", ret);
+		break;
+	default:
+		break;
+	}
+	mutex_unlock(&moorechip->lock);
+}
+
+static int moorechip_register_panel_notifier(struct moorechip_driver *moorechip)
+{
+	struct device *dev = &moorechip->serdev->dev;
+	struct device_node *panel_node;
+	struct drm_panel *panel;
+	int ret;
+
+	panel_node = of_parse_phandle(dev->of_node, "panel", 0);
+	if (!panel_node)
+		return dev_err_probe(dev, -ENODEV, "Missing panel phandle\n");
+
+	panel = of_drm_find_panel(panel_node);
+	of_node_put(panel_node);
+	if (IS_ERR(panel))
+		return dev_err_probe(dev, PTR_ERR(panel),
+				     "Failed to find joystick panel\n");
+
+	moorechip->notifier_cookie = panel_event_notifier_register(
+		PANEL_EVENT_NOTIFICATION_PRIMARY,
+		PANEL_EVENT_NOTIFIER_CLIENT_JOYSTICK, panel,
+		moorechip_panel_event_notifier_callback, moorechip);
+	if (IS_ERR(moorechip->notifier_cookie)) {
+		ret = PTR_ERR(moorechip->notifier_cookie);
+		moorechip->notifier_cookie = NULL;
+		return dev_err_probe(dev, ret,
+				     "Failed to register panel notifier\n");
+	}
+
+	return 0;
+}
+
 #define MOORECHIP_CALIB_NUM_FIELDS 20
 
 static bool moorechip_abs_calib_valid(const struct moorechip_abs_calib *cal)
@@ -1084,7 +1284,9 @@ static ssize_t set_left_stick_axis_swap(struct device *dev, struct device_attrib
 	if (ret)
 		return ret;
 
+	mutex_lock(&moorechip->lock);
 	ret = moorechip_set_left_stick_axis_swap(moorechip, enable);
+	mutex_unlock(&moorechip->lock);
 	if (ret)
 		return ret;
 
@@ -1096,6 +1298,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 {
 	struct moorechip_driver *moorechip;
 	struct device *dev = &serdev->dev;
+	struct device *joystick;
 	int ret = 0;
 
 	moorechip = devm_kzalloc(dev, sizeof(*moorechip), GFP_KERNEL);
@@ -1103,6 +1306,9 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 		return -ENOMEM;
 
 	moorechip->serdev = serdev;
+	mutex_init(&moorechip->lock);
+	moorechip->panel_on = true;
+	moorechip->fw_recheck = true;
 	moorechip->seq = 0;
 	memset(&moorechip->last_keys, 0, sizeof(moorechip->last_keys));
 	moorechip->calib_stick_left.x.min = -1350;
@@ -1160,6 +1366,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	}
 
 	serdev_device_set_drvdata(serdev, moorechip);
+	serdev_device_set_client_ops(serdev, &moorechip_joystick_ops);
 	moorechip->input = NULL;
 
 	if (of_property_read_bool(dev->of_node, "moorechip,layout-xbox")) {
@@ -1219,74 +1426,59 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 		}
 	}
 
-	ret = serdev_device_open(serdev);
-	if (ret) {
-		dev_err(dev, "Failed to open serdev device; ret=%d\n", ret);
-		goto err;
-	}
-	serdev_device_set_client_ops(serdev, &moorechip_joystick_ops);
-	serdev_device_set_flow_control(serdev, false);
-	serdev_device_set_baudrate(serdev, 115200);
-
 	ret = moorechip_joystick_register_input(moorechip);
 	if (ret)
-		goto err_sdev_close;
+		goto err;
 
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
 	moorechip->class = class_create("moorechip-joystick");
 #else
 	moorechip->class = class_create(THIS_MODULE, "moorechip-joystick");
 #endif
-	if (moorechip->class != NULL) {
-		struct device *joystick = device_create(moorechip->class, NULL, 0, NULL, "joystick");
-		dev_set_drvdata(joystick, moorechip);
-		device_create_file(joystick, &dev_attr_calibration);
-		device_create_file(joystick, &dev_attr_raw);
-		device_create_file(joystick, &dev_attr_layout);
-		device_create_file(joystick, &dev_attr_triggers);
-		device_create_file(joystick, &dev_attr_ignore_mask);
-		device_create_file(joystick, &dev_attr_firmware_version);
-		if (moorechip->m0_key)
-			device_create_file(joystick, &dev_attr_m0_function);
-		if (moorechip->m1_key)
-			device_create_file(joystick, &dev_attr_m1_function);
-		device_create_file(joystick, &dev_attr_left_stick_axis_swap);
+	if (IS_ERR(moorechip->class)) {
+		ret = PTR_ERR(moorechip->class);
+		moorechip->class = NULL;
+		goto err;
 	}
 
-	if (moorechip->boot_gpio >= 0)
-		gpio_direction_output(moorechip->boot_gpio, 0);
-	if (moorechip->reset_gpio >= 0)
-		gpio_direction_output(moorechip->reset_gpio, 0);
-
-	ret = regulator_enable(moorechip->vdd_reg);
-	if (ret) {
-		dev_err(dev, "Failed to enable joystick vdd regulator\n");
-		goto err_sdev_close;
+	joystick = device_create(moorechip->class, NULL, 0, NULL, "joystick");
+	if (IS_ERR(joystick)) {
+		ret = PTR_ERR(joystick);
+		goto err_destroy_class;
 	}
+	dev_set_drvdata(joystick, moorechip);
+	device_create_file(joystick, &dev_attr_calibration);
+	device_create_file(joystick, &dev_attr_raw);
+	device_create_file(joystick, &dev_attr_layout);
+	device_create_file(joystick, &dev_attr_triggers);
+	device_create_file(joystick, &dev_attr_ignore_mask);
+	device_create_file(joystick, &dev_attr_firmware_version);
+	if (moorechip->m0_key)
+		device_create_file(joystick, &dev_attr_m0_function);
+	if (moorechip->m1_key)
+		device_create_file(joystick, &dev_attr_m1_function);
+	device_create_file(joystick, &dev_attr_left_stick_axis_swap);
 
-	ret = regulator_enable(moorechip->levelshifter_reg);
-	if (ret) {
-		dev_err(dev,
-			"Failed to enable joystick levelshifter regulator\n");
-		goto err_sdev_close;
-	}
+	ret = moorechip_register_panel_notifier(moorechip);
+	if (ret)
+		goto err_destroy_class_device;
 
-	msleep(40);
-
-	if (moorechip->reset_gpio >= 0) {
-		gpio_direction_output(moorechip->reset_gpio, 1);
-		msleep(100);
-	}
-
-	moorechip_set_input_transmit_enabled(moorechip, true);
-	msleep(100);
-
-	moorechip_get_firmware_version(moorechip);
+	mutex_lock(&moorechip->lock);
+	ret = moorechip_joystick_power_on_locked(moorechip);
+	mutex_unlock(&moorechip->lock);
+	if (ret)
+		goto err_unregister_notifier;
 
 	return 0;
 
-err_sdev_close:
-	serdev_device_close(serdev);
+err_unregister_notifier:
+	panel_event_notifier_unregister(moorechip->notifier_cookie);
+	moorechip->notifier_cookie = NULL;
+err_destroy_class_device:
+	device_destroy(moorechip->class, 0);
+err_destroy_class:
+	class_destroy(moorechip->class);
+	moorechip->class = NULL;
 
 err:
 	return ret;
@@ -1296,43 +1488,31 @@ static void moorechip_joystick_remove(struct serdev_device *serdev)
 {
 	struct moorechip_driver *moorechip = serdev_device_get_drvdata(serdev);
 
+	mutex_lock(&moorechip->lock);
+	moorechip->panel_on = false;
+	moorechip->system_suspended = true;
+	moorechip_joystick_power_off_locked(moorechip);
+	mutex_unlock(&moorechip->lock);
+
+	if (moorechip->notifier_cookie) {
+		panel_event_notifier_unregister(moorechip->notifier_cookie);
+		moorechip->notifier_cookie = NULL;
+	}
+
 	if (moorechip->class) {
 		device_destroy(moorechip->class, 0);
 		class_destroy(moorechip->class);
 	}
-
-	moorechip_set_input_processing_enabled(moorechip, false);
-
-	moorechip_set_input_transmit_enabled(moorechip, false);
-
-	serdev_device_close(serdev);
-
-	if(moorechip->reset_gpio >= 0)
-		gpio_direction_output(moorechip->reset_gpio, 0);
-	if (moorechip->boot_gpio >= 0)
-		gpio_direction_output(moorechip->boot_gpio, 0);
-
-	if (!IS_ERR_OR_NULL(moorechip->vdd_reg) && regulator_is_enabled(moorechip->vdd_reg))
-		regulator_disable(moorechip->vdd_reg);
-
-	if (!IS_ERR_OR_NULL(moorechip->levelshifter_reg) && regulator_is_enabled(moorechip->levelshifter_reg))
-		regulator_disable(moorechip->levelshifter_reg);
 }
 
 static int __maybe_unused moorechip_joystick_suspend(struct device *dev)
 {
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
 
-	if(moorechip->reset_gpio >= 0)
-			gpio_direction_output(moorechip->reset_gpio, 0);
-	if (moorechip->boot_gpio >= 0)
-		gpio_direction_output(moorechip->boot_gpio, 0);
-
-	if (regulator_is_enabled(moorechip->vdd_reg))
-		regulator_disable(moorechip->vdd_reg);
-
-	if (regulator_is_enabled(moorechip->levelshifter_reg))
-		regulator_disable(moorechip->levelshifter_reg);
+	mutex_lock(&moorechip->lock);
+	moorechip->system_suspended = true;
+	moorechip_joystick_power_off_locked(moorechip);
+	mutex_unlock(&moorechip->lock);
 
 	return 0;
 }
@@ -1342,44 +1522,12 @@ static int __maybe_unused moorechip_joystick_resume(struct device *dev)
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
 	int ret;
 
-	if (moorechip->boot_gpio >= 0)
-		gpio_direction_output(moorechip->boot_gpio, 0);
-	if (moorechip->reset_gpio >= 0)
-		gpio_direction_output(moorechip->reset_gpio, 0);
+	mutex_lock(&moorechip->lock);
+	moorechip->system_suspended = false;
+	ret = moorechip_joystick_power_on_locked(moorechip);
+	mutex_unlock(&moorechip->lock);
 
-	if (!regulator_is_enabled(moorechip->vdd_reg)) {
-		ret = regulator_enable(moorechip->vdd_reg);
-		if (ret) {
-			dev_err(dev, "Failed to enable joystick vdd regulator\n");
-			return ret;
-		}
-	}
-
-	if (!regulator_is_enabled(moorechip->levelshifter_reg)) {
-		ret = regulator_enable(moorechip->levelshifter_reg);
-		if (ret) {
-			dev_err(dev,
-				"Failed to enable joystick levelshifter regulator\n");
-			return ret;
-		}
-	}
-
-	msleep(40);
-
-	if(moorechip->reset_gpio >= 0) {
-		gpio_direction_output(moorechip->reset_gpio, 1);
-		msleep(100);
-	}
-
-	moorechip_set_input_transmit_enabled(moorechip, true);
-	msleep(100);
-
-	moorechip_set_parameter(moorechip, 40, 7);
-	msleep(100);
-
-	moorechip_set_input_processing_enabled(moorechip, true);
-
-	return 0;
+	return ret;
 }
 
 #ifdef CONFIG_OF
