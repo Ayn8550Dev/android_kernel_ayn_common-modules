@@ -3,6 +3,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
@@ -59,6 +60,9 @@ struct htr3212_status {
 	int group_count;
 	struct htr3212_led_group *led_groups;
 	void *notifier_cookie;
+	void *notifier_cookie_sec;
+	struct mutex lock;
+	bool panel_on[2];
 	bool shutdown;
 };
 
@@ -91,6 +95,7 @@ static int htr3212_brightness_set(struct led_classdev *cdev,
 	struct i2c_client *client = htr3212->client;
 	int i;
 
+	mutex_lock(&htr3212->lock);
 	led_mc_calc_color_components(mcled_cdev, brightness);
 
 	for (i = 0; i < mcled_cdev->num_colors; i++) {
@@ -102,40 +107,90 @@ static int htr3212_brightness_set(struct led_classdev *cdev,
 	}
 
 	htr3212_write_reg(client, HTR3212_PWM_UPDATE, 0x00);
+	mutex_unlock(&htr3212->lock);
 
 	return 0;
 };
+
+static void htr3212_apply_panel_state_locked(struct htr3212_status *htr3212)
+{
+	bool shutdown = !htr3212->panel_on[0] && !htr3212->panel_on[1];
+
+	if (htr3212->shutdown == shutdown)
+		return;
+
+	if (regulator_is_enabled(htr3212->vdd_reg))
+		htr3212_write_reg(htr3212->client, HTR3212_SHUTDOWN,
+				  shutdown ? HTR3212_SHUTDOWN_OFF :
+					     HTR3212_SHUTDOWN_ON);
+
+	htr3212->shutdown = shutdown;
+}
 
 static void htr3212_panel_event_notifier_callback(
 	enum panel_event_notifier_tag tag,
 	struct panel_event_notification *notification, void *data)
 {
 	struct htr3212_status *htr3212 = data;
+	int panel_idx;
 
 	if (!notification) {
 		dev_err(&htr3212->client->dev, "Invalid panel notification\n");
 		return;
 	}
 
+	switch (tag) {
+	case PANEL_EVENT_NOTIFICATION_PRIMARY:
+		panel_idx = 0;
+		break;
+	case PANEL_EVENT_NOTIFICATION_SECONDARY:
+		panel_idx = 1;
+		break;
+	default:
+		return;
+	}
+
 	dev_dbg(&htr3212->client->dev, "panel event received, type: %d\n", notification->notif_type);
+	mutex_lock(&htr3212->lock);
 	switch (notification->notif_type) {
 	case DRM_PANEL_EVENT_BLANK:
-		if (regulator_is_enabled(htr3212->vdd_reg))
-			htr3212_write_reg(htr3212->client, HTR3212_SHUTDOWN,
-					  HTR3212_SHUTDOWN_OFF);
-
-		htr3212->shutdown = true;
+		htr3212->panel_on[panel_idx] = false;
+		htr3212_apply_panel_state_locked(htr3212);
 		break;
 	case DRM_PANEL_EVENT_UNBLANK:
-		if (regulator_is_enabled(htr3212->vdd_reg))
-			htr3212_write_reg(htr3212->client, HTR3212_SHUTDOWN,
-					  HTR3212_SHUTDOWN_ON);
-
-		htr3212->shutdown = false;
+		htr3212->panel_on[panel_idx] = true;
+		htr3212_apply_panel_state_locked(htr3212);
 		break;
 	default:
 		dev_dbg(&htr3212->client->dev, "Ignore panel event: %d\n", notification->notif_type);
 		break;
+	}
+	mutex_unlock(&htr3212->lock);
+}
+
+static void htr3212_unregister_panel_notifiers(struct htr3212_status *htr3212)
+{
+	if (htr3212->notifier_cookie_sec) {
+		panel_event_notifier_unregister(htr3212->notifier_cookie_sec);
+		htr3212->notifier_cookie_sec = NULL;
+	}
+
+	if (htr3212->notifier_cookie) {
+		panel_event_notifier_unregister(htr3212->notifier_cookie);
+		htr3212->notifier_cookie = NULL;
+	}
+}
+
+static enum panel_event_notifier_client htr3212_secondary_client(
+		enum panel_event_notifier_client primary_client)
+{
+	switch (primary_client) {
+	case PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_LEFT:
+		return PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_LEFT_SEC;
+	case PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_RIGHT:
+		return PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_RIGHT_SEC;
+	default:
+		return PANEL_EVENT_NOTIFIER_CLIENT_MAX;
 	}
 }
 
@@ -145,6 +200,8 @@ static int htr3212_register_panel_notifier(struct htr3212_status *htr3212)
 	struct device_node *pnode;
 	struct drm_panel *panel = NULL;
 	void *cookie = NULL;
+	enum panel_event_notifier_client primary_client;
+	enum panel_event_notifier_client secondary_client;
 	int i, count, rc;
 
 	count = of_count_phandle_with_args(np, "panel", NULL);
@@ -171,15 +228,17 @@ static int htr3212_register_panel_notifier(struct htr3212_status *htr3212)
 		return rc;
 	}
 
+	primary_client = PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_LEFT;
 	cookie = panel_event_notifier_register(
 		PANEL_EVENT_NOTIFICATION_PRIMARY,
-		PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_LEFT, panel,
+		primary_client, panel,
 		htr3212_panel_event_notifier_callback, (void *)htr3212);
 
 	if (IS_ERR(cookie) && PTR_ERR(cookie) == -EEXIST) {
+		primary_client = PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_RIGHT;
 		cookie = panel_event_notifier_register(
 			PANEL_EVENT_NOTIFICATION_PRIMARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_LIGHTS_RIGHT, panel,
+			primary_client, panel,
 			htr3212_panel_event_notifier_callback, (void *)htr3212);
 	}
 
@@ -191,7 +250,49 @@ static int htr3212_register_panel_notifier(struct htr3212_status *htr3212)
 
 	dev_dbg(&htr3212->client->dev, "register panel notifier successfully\n");
 	htr3212->notifier_cookie = cookie;
+
+	pnode = of_parse_phandle(np, "secondary-panel", 0);
+	if (!pnode)
+		return 0;
+
+	panel = of_drm_find_panel(pnode);
+	of_node_put(pnode);
+	if (IS_ERR(panel)) {
+		rc = PTR_ERR(panel);
+		if (rc != -EPROBE_DEFER) {
+			dev_err(&htr3212->client->dev,
+				"failed to find secondary panel, rc=%d\n", rc);
+			return 0;
+		}
+		goto err_unregister;
+	}
+
+	secondary_client = htr3212_secondary_client(primary_client);
+	if (secondary_client == PANEL_EVENT_NOTIFIER_CLIENT_MAX) {
+		dev_err(&htr3212->client->dev,
+			"invalid secondary panel notifier client\n");
+		return 0;
+	}
+
+	cookie = panel_event_notifier_register(
+		PANEL_EVENT_NOTIFICATION_SECONDARY,
+		secondary_client, panel,
+		htr3212_panel_event_notifier_callback, (void *)htr3212);
+	if (IS_ERR(cookie)) {
+		rc = PTR_ERR(cookie);
+		dev_err(&htr3212->client->dev,
+			"failed to register secondary panel notifier, rc=%d\n", rc);
+		if (rc != -EPROBE_DEFER)
+			return 0;
+		goto err_unregister;
+	}
+
+	htr3212->notifier_cookie_sec = cookie;
 	return 0;
+
+err_unregister:
+	htr3212_unregister_panel_notifiers(htr3212);
+	return rc;
 }
 
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
@@ -215,9 +316,9 @@ static int htr3212_probe(struct i2c_client *client, const struct i2c_device_id *
 	dev_set_drvdata(&client->dev, htr3212);
 
 	htr3212->client = client;
-
-	if (htr3212_register_panel_notifier(htr3212) == -EPROBE_DEFER)
-		return -EPROBE_DEFER;
+	mutex_init(&htr3212->lock);
+	htr3212->panel_on[0] = true;
+	htr3212->panel_on[1] = true;
 
 	htr3212->vdd_reg = devm_regulator_get(&client->dev, "vdd");
 	if (IS_ERR(htr3212->vdd_reg)) {
@@ -225,6 +326,9 @@ static int htr3212_probe(struct i2c_client *client, const struct i2c_device_id *
 		dev_err(&client->dev, "Failed to get vdd regulator\n");
 		goto exit;
 	}
+
+	if (htr3212_register_panel_notifier(htr3212) == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
 
 	device_for_each_child_node (&client->dev, child)
 		++group_count;
@@ -335,14 +439,15 @@ static int htr3212_remove(struct i2c_client *client)
 {
 	struct htr3212_status *htr3212 = dev_get_drvdata(&client->dev);
 
+	htr3212_unregister_panel_notifiers(htr3212);
+
+	mutex_lock(&htr3212->lock);
 	htr3212_write_reg(htr3212->client, HTR3212_SHUTDOWN,
 			  HTR3212_SHUTDOWN_OFF);
 
 	if (!IS_ERR_OR_NULL(htr3212->vdd_reg) && regulator_is_enabled(htr3212->vdd_reg))
 		regulator_disable(htr3212->vdd_reg);
-
-	if (htr3212->notifier_cookie)
-		panel_event_notifier_unregister(htr3212->notifier_cookie);
+	mutex_unlock(&htr3212->lock);
 
 	kfree(htr3212);
 
@@ -355,8 +460,10 @@ static int __maybe_unused htr3212_suspend(struct device *dev)
 {
 	struct htr3212_status *htr3212 = dev_get_drvdata(dev);
 
+	mutex_lock(&htr3212->lock);
 	if (regulator_is_enabled(htr3212->vdd_reg))
 		regulator_disable(htr3212->vdd_reg);
+	mutex_unlock(&htr3212->lock);
 
 	return 0;
 }
@@ -366,10 +473,12 @@ static int __maybe_unused htr3212_resume(struct device *dev)
 	struct htr3212_status *htr3212 = dev_get_drvdata(dev);
 	int rc, i;
 
+	mutex_lock(&htr3212->lock);
 	if (!regulator_is_enabled(htr3212->vdd_reg)) {
 		rc = regulator_enable(htr3212->vdd_reg);
 		if (rc) {
 			dev_err(dev, "Failed to enable vdd regulator\n");
+			mutex_unlock(&htr3212->lock);
 			return rc;
 		}
 	}
@@ -402,6 +511,7 @@ static int __maybe_unused htr3212_resume(struct device *dev)
 	htr3212_write_reg(htr3212->client, HTR3212_PWM_UPDATE, 0x00);
 	htr3212_write_reg(htr3212->client, HTR3212_SHUTDOWN,
 			  htr3212->shutdown ? HTR3212_SHUTDOWN_OFF : HTR3212_SHUTDOWN_ON);
+	mutex_unlock(&htr3212->lock);
 
 	return 0;
 }
