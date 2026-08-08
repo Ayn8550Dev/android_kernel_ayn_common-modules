@@ -171,8 +171,9 @@ struct moorechip_driver {
 	u32 m1_code;
 	struct mutex lock;
 	void *notifier_cookie;
+	void *notifier_cookie_sec;
 	bool active;
-	bool panel_on;
+	bool panel_on[2];
 	bool system_suspended;
 	bool fw_recheck;
 };
@@ -827,7 +828,8 @@ static int moorechip_joystick_power_on_locked(
 	struct device *dev = &moorechip->serdev->dev;
 	int ret;
 
-	if (moorechip->active || !moorechip->panel_on ||
+	if (moorechip->active ||
+	    (!moorechip->panel_on[0] && !moorechip->panel_on[1]) ||
 	    moorechip->system_suspended)
 		return 0;
 
@@ -902,10 +904,22 @@ static void moorechip_panel_event_notifier_callback(
 		struct panel_event_notification *notification, void *data)
 {
 	struct moorechip_driver *moorechip = data;
+	int panel_idx;
 	int ret;
 
 	if (!notification)
 		return;
+
+	switch (tag) {
+	case PANEL_EVENT_NOTIFICATION_PRIMARY:
+		panel_idx = 0;
+		break;
+	case PANEL_EVENT_NOTIFICATION_SECONDARY:
+		panel_idx = 1;
+		break;
+	default:
+		return;
+	}
 
 	mutex_lock(&moorechip->lock);
 	switch (notification->notif_type) {
@@ -913,13 +927,14 @@ static void moorechip_panel_event_notifier_callback(
 	case DRM_PANEL_EVENT_BLANK_LP:
 		if (!notification->notif_data.early_trigger)
 			break;
-		moorechip->panel_on = false;
-		moorechip_joystick_power_off_locked(moorechip);
+		moorechip->panel_on[panel_idx] = false;
+		if (!moorechip->panel_on[0] && !moorechip->panel_on[1])
+			moorechip_joystick_power_off_locked(moorechip);
 		break;
 	case DRM_PANEL_EVENT_UNBLANK:
 		if (notification->notif_data.early_trigger)
 			break;
-		moorechip->panel_on = true;
+		moorechip->panel_on[panel_idx] = true;
 		ret = moorechip_joystick_power_on_locked(moorechip);
 		if (ret)
 			dev_err(&moorechip->serdev->dev,
@@ -931,35 +946,77 @@ static void moorechip_panel_event_notifier_callback(
 	mutex_unlock(&moorechip->lock);
 }
 
-static int moorechip_register_panel_notifier(struct moorechip_driver *moorechip)
+static int moorechip_register_panel_notifier_one(
+		struct moorechip_driver *moorechip, const char *property,
+		enum panel_event_notifier_tag tag,
+		enum panel_event_notifier_client client, void **cookie,
+		bool required)
 {
 	struct device *dev = &moorechip->serdev->dev;
 	struct device_node *panel_node;
 	struct drm_panel *panel;
 	int ret;
 
-	panel_node = of_parse_phandle(dev->of_node, "panel", 0);
-	if (!panel_node)
-		return dev_err_probe(dev, -ENODEV, "Missing panel phandle\n");
+	panel_node = of_parse_phandle(dev->of_node, property, 0);
+	if (!panel_node) {
+		if (!required)
+			return 0;
+		return dev_err_probe(dev, -ENODEV, "Missing %s phandle\n",
+					     property);
+	}
 
 	panel = of_drm_find_panel(panel_node);
 	of_node_put(panel_node);
 	if (IS_ERR(panel))
 		return dev_err_probe(dev, PTR_ERR(panel),
-				     "Failed to find joystick panel\n");
+				     "Failed to find joystick %s\n", property);
 
-	moorechip->notifier_cookie = panel_event_notifier_register(
-		PANEL_EVENT_NOTIFICATION_PRIMARY,
-		PANEL_EVENT_NOTIFIER_CLIENT_JOYSTICK, panel,
+	*cookie = panel_event_notifier_register(
+		tag, client, panel,
 		moorechip_panel_event_notifier_callback, moorechip);
-	if (IS_ERR(moorechip->notifier_cookie)) {
-		ret = PTR_ERR(moorechip->notifier_cookie);
-		moorechip->notifier_cookie = NULL;
+	if (IS_ERR(*cookie)) {
+		ret = PTR_ERR(*cookie);
+		*cookie = NULL;
 		return dev_err_probe(dev, ret,
-				     "Failed to register panel notifier\n");
+				     "Failed to register %s notifier\n", property);
 	}
 
 	return 0;
+}
+
+static void moorechip_unregister_panel_notifiers(
+		struct moorechip_driver *moorechip)
+{
+	if (moorechip->notifier_cookie_sec) {
+		panel_event_notifier_unregister(moorechip->notifier_cookie_sec);
+		moorechip->notifier_cookie_sec = NULL;
+	}
+
+	if (moorechip->notifier_cookie) {
+		panel_event_notifier_unregister(moorechip->notifier_cookie);
+		moorechip->notifier_cookie = NULL;
+	}
+}
+
+static int moorechip_register_panel_notifier(struct moorechip_driver *moorechip)
+{
+	int ret;
+
+	ret = moorechip_register_panel_notifier_one(moorechip, "panel",
+		PANEL_EVENT_NOTIFICATION_PRIMARY,
+		PANEL_EVENT_NOTIFIER_CLIENT_JOYSTICK,
+		&moorechip->notifier_cookie, true);
+	if (ret)
+		return ret;
+
+	ret = moorechip_register_panel_notifier_one(moorechip,
+		"secondary-panel", PANEL_EVENT_NOTIFICATION_SECONDARY,
+		PANEL_EVENT_NOTIFIER_CLIENT_JOYSTICK_SEC,
+		&moorechip->notifier_cookie_sec, false);
+	if (ret)
+		moorechip_unregister_panel_notifiers(moorechip);
+
+	return ret;
 }
 
 #define MOORECHIP_CALIB_NUM_FIELDS 20
@@ -1307,7 +1364,8 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 
 	moorechip->serdev = serdev;
 	mutex_init(&moorechip->lock);
-	moorechip->panel_on = true;
+	moorechip->panel_on[0] = true;
+	moorechip->panel_on[1] = true;
 	moorechip->fw_recheck = true;
 	moorechip->seq = 0;
 	memset(&moorechip->last_keys, 0, sizeof(moorechip->last_keys));
@@ -1472,8 +1530,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	return 0;
 
 err_unregister_notifier:
-	panel_event_notifier_unregister(moorechip->notifier_cookie);
-	moorechip->notifier_cookie = NULL;
+	moorechip_unregister_panel_notifiers(moorechip);
 err_destroy_class_device:
 	device_destroy(moorechip->class, 0);
 err_destroy_class:
@@ -1489,15 +1546,13 @@ static void moorechip_joystick_remove(struct serdev_device *serdev)
 	struct moorechip_driver *moorechip = serdev_device_get_drvdata(serdev);
 
 	mutex_lock(&moorechip->lock);
-	moorechip->panel_on = false;
+	moorechip->panel_on[0] = false;
+	moorechip->panel_on[1] = false;
 	moorechip->system_suspended = true;
 	moorechip_joystick_power_off_locked(moorechip);
 	mutex_unlock(&moorechip->lock);
 
-	if (moorechip->notifier_cookie) {
-		panel_event_notifier_unregister(moorechip->notifier_cookie);
-		moorechip->notifier_cookie = NULL;
-	}
+	moorechip_unregister_panel_notifiers(moorechip);
 
 	if (moorechip->class) {
 		device_destroy(moorechip->class, 0);
