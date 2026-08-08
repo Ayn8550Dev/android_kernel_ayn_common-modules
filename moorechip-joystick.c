@@ -1014,9 +1014,11 @@ static int moorechip_register_panel_notifier(struct moorechip_driver *moorechip)
 		PANEL_EVENT_NOTIFIER_CLIENT_JOYSTICK_SEC,
 		&moorechip->notifier_cookie_sec, false);
 	if (ret)
-		moorechip_unregister_panel_notifiers(moorechip);
+		dev_warn(&moorechip->serdev->dev,
+			 "Secondary panel notifier unavailable, continuing primary-only: %d\n",
+			 ret);
 
-	return ret;
+	return 0;
 }
 
 #define MOORECHIP_CALIB_NUM_FIELDS 20
@@ -1365,7 +1367,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	moorechip->serdev = serdev;
 	mutex_init(&moorechip->lock);
 	moorechip->panel_on[0] = true;
-	moorechip->panel_on[1] = true;
+	moorechip->panel_on[1] = false;
 	moorechip->fw_recheck = true;
 	moorechip->seq = 0;
 	memset(&moorechip->last_keys, 0, sizeof(moorechip->last_keys));
@@ -1520,6 +1522,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	ret = moorechip_register_panel_notifier(moorechip);
 	if (ret)
 		goto err_destroy_class_device;
+	moorechip->panel_on[1] = !!moorechip->notifier_cookie_sec;
 
 	mutex_lock(&moorechip->lock);
 	ret = moorechip_joystick_power_on_locked(moorechip);
