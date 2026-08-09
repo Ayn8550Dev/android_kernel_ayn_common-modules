@@ -311,7 +311,7 @@ static int htr3212_probe(struct i2c_client *client, const struct i2c_device_id *
 	htr3212->client = client;
 	mutex_init(&htr3212->lock);
 	htr3212->panel_on[0] = true;
-	htr3212->panel_on[1] = true;
+	htr3212->panel_on[1] = false;
 
 	htr3212->vdd_reg = devm_regulator_get(&client->dev, "vdd");
 	if (IS_ERR(htr3212->vdd_reg)) {
@@ -322,6 +322,7 @@ static int htr3212_probe(struct i2c_client *client, const struct i2c_device_id *
 
 	if (htr3212_register_panel_notifier(htr3212) == -EPROBE_DEFER)
 		return -EPROBE_DEFER;
+	htr3212->panel_on[1] = !!htr3212->notifier_cookie_sec;
 
 	device_for_each_child_node (&client->dev, child)
 		++group_count;

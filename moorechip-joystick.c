@@ -1367,7 +1367,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	moorechip->serdev = serdev;
 	mutex_init(&moorechip->lock);
 	moorechip->panel_on[0] = true;
-	moorechip->panel_on[1] = true;
+	moorechip->panel_on[1] = false;
 	moorechip->fw_recheck = true;
 	moorechip->seq = 0;
 	memset(&moorechip->last_keys, 0, sizeof(moorechip->last_keys));
@@ -1522,6 +1522,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	ret = moorechip_register_panel_notifier(moorechip);
 	if (ret)
 		goto err_destroy_class_device;
+	moorechip->panel_on[1] = !!moorechip->notifier_cookie_sec;
 
 	mutex_lock(&moorechip->lock);
 	ret = moorechip_joystick_power_on_locked(moorechip);
