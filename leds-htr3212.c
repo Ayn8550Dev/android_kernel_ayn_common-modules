@@ -154,6 +154,7 @@ static void htr3212_panel_event_notifier_callback(
 	mutex_lock(&htr3212->lock);
 	switch (notification->notif_type) {
 	case DRM_PANEL_EVENT_BLANK:
+	case DRM_PANEL_EVENT_BLANK_LP:
 		htr3212->panel_on[panel_idx] = false;
 		htr3212_apply_panel_state_locked(htr3212);
 		break;

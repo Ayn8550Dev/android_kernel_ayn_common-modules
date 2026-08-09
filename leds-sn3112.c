@@ -122,6 +122,7 @@ static void sn3112_panel_event_notifier_callback(
 	dev_dbg(&sn3112->client->dev, "panel event received, type: %d\n", notification->notif_type);
 	switch (notification->notif_type) {
 	case DRM_PANEL_EVENT_BLANK:
+	case DRM_PANEL_EVENT_BLANK_LP:
 		if (regulator_is_enabled(sn3112->vdd_reg))
 			sn3112_write_reg(sn3112->client, SN3112_SHUTDOWN,
 					  SN3112_SHUTDOWN_OFF);
