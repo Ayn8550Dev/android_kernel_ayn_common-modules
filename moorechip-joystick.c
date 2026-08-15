@@ -177,6 +177,7 @@ struct moorechip_driver {
 	void *notifier_cookie_sec;
 	bool active;
 	bool panel_on[2];
+	bool panel_event_seen[2];
 	bool system_suspended;
 	bool stopping;
 	bool fw_recheck;
@@ -1001,6 +1002,7 @@ static void moorechip_panel_event_notifier_callback(
 	spin_lock_irqsave(&moorechip->power_state_lock, flags);
 	if (!moorechip->stopping) {
 		moorechip->panel_on[panel_idx] = panel_on;
+		moorechip->panel_event_seen[panel_idx] = true;
 		if (!moorechip->system_suspended)
 			schedule_work(&moorechip->power_work);
 	}
@@ -1615,7 +1617,8 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 		goto err_destroy_class_device;
 
 	spin_lock_irqsave(&moorechip->power_state_lock, flags);
-	moorechip->panel_on[1] = !!moorechip->notifier_cookie_sec;
+	if (!moorechip->panel_event_seen[1])
+		moorechip->panel_on[1] = !!moorechip->notifier_cookie_sec;
 	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
 
 	mutex_lock(&moorechip->lock);
