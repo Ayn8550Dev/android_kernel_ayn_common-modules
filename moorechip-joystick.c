@@ -15,6 +15,7 @@
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <drm/drm_panel.h>
 
@@ -171,11 +172,13 @@ struct moorechip_driver {
 	int m1_irq;
 	u32 m1_code;
 	struct mutex lock;
+	spinlock_t power_state_lock;
 	void *notifier_cookie;
 	void *notifier_cookie_sec;
 	bool active;
 	bool panel_on[2];
 	bool system_suspended;
+	bool stopping;
 	bool fw_recheck;
 	bool left_stick_axis_swap;
 	struct work_struct power_work;
@@ -847,9 +850,7 @@ static int moorechip_joystick_power_on_locked(
 	struct device *dev = &moorechip->serdev->dev;
 	int ret;
 
-	if (moorechip->active ||
-	    (!moorechip->panel_on[0] && !moorechip->panel_on[1]) ||
-	    moorechip->system_suspended)
+	if (moorechip->active)
 		return 0;
 
 	if (moorechip->boot_gpio >= 0)
@@ -922,6 +923,28 @@ err_disable_vdd:
 	return ret;
 }
 
+static bool moorechip_power_wanted(struct moorechip_driver *moorechip)
+{
+	unsigned long flags;
+	bool wanted;
+
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
+	wanted = !moorechip->stopping && !moorechip->system_suspended &&
+		 (moorechip->panel_on[0] || moorechip->panel_on[1]);
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
+
+	return wanted;
+}
+
+static int moorechip_apply_power_state_locked(struct moorechip_driver *moorechip)
+{
+	if (moorechip_power_wanted(moorechip))
+		return moorechip_joystick_power_on_locked(moorechip);
+
+	moorechip_joystick_power_off_locked(moorechip);
+	return 0;
+}
+
 static void moorechip_power_work(struct work_struct *work)
 {
 	struct moorechip_driver *moorechip =
@@ -929,10 +952,10 @@ static void moorechip_power_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&moorechip->lock);
-	ret = moorechip_joystick_power_on_locked(moorechip);
+	ret = moorechip_apply_power_state_locked(moorechip);
 	if (ret)
 		dev_err(&moorechip->serdev->dev,
-			"Failed to resume joystick: %d\n", ret);
+			"Failed to update joystick power state: %d\n", ret);
 	mutex_unlock(&moorechip->lock);
 }
 
@@ -941,7 +964,9 @@ static void moorechip_panel_event_notifier_callback(
 		struct panel_event_notification *notification, void *data)
 {
 	struct moorechip_driver *moorechip = data;
+	unsigned long flags;
 	int panel_idx;
+	bool panel_on;
 
 	if (!notification)
 		return;
@@ -957,28 +982,29 @@ static void moorechip_panel_event_notifier_callback(
 		return;
 	}
 
-	mutex_lock(&moorechip->lock);
 	switch (notification->notif_type) {
 	case DRM_PANEL_EVENT_BLANK:
 	case DRM_PANEL_EVENT_BLANK_LP:
 		if (!notification->notif_data.early_trigger)
-			break;
-		moorechip->panel_on[panel_idx] = false;
-		if (!moorechip->panel_on[0] && !moorechip->panel_on[1]) {
-			cancel_work(&moorechip->power_work);
-			moorechip_joystick_power_off_locked(moorechip);
-		}
+			return;
+		panel_on = false;
 		break;
 	case DRM_PANEL_EVENT_UNBLANK:
 		if (notification->notif_data.early_trigger)
-			break;
-		moorechip->panel_on[panel_idx] = true;
-		schedule_work(&moorechip->power_work);
+			return;
+		panel_on = true;
 		break;
 	default:
-		break;
+		return;
 	}
-	mutex_unlock(&moorechip->lock);
+
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
+	if (!moorechip->stopping) {
+		moorechip->panel_on[panel_idx] = panel_on;
+		if (!moorechip->system_suspended)
+			schedule_work(&moorechip->power_work);
+	}
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
 }
 
 static int moorechip_register_panel_notifier_one(
@@ -1031,6 +1057,25 @@ static void moorechip_unregister_panel_notifiers(
 		panel_event_notifier_unregister(moorechip->notifier_cookie);
 		moorechip->notifier_cookie = NULL;
 	}
+}
+
+static void moorechip_stop_power_work(struct moorechip_driver *moorechip)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
+	moorechip->stopping = true;
+	moorechip->system_suspended = true;
+	moorechip->panel_on[0] = false;
+	moorechip->panel_on[1] = false;
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
+
+	moorechip_unregister_panel_notifiers(moorechip);
+	cancel_work_sync(&moorechip->power_work);
+
+	mutex_lock(&moorechip->lock);
+	moorechip_joystick_power_off_locked(moorechip);
+	mutex_unlock(&moorechip->lock);
 }
 
 static int moorechip_register_panel_notifier(struct moorechip_driver *moorechip)
@@ -1401,6 +1446,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	struct moorechip_driver *moorechip;
 	struct device *dev = &serdev->dev;
 	struct device *joystick;
+	unsigned long flags;
 	int ret = 0;
 
 	moorechip = devm_kzalloc(dev, sizeof(*moorechip), GFP_KERNEL);
@@ -1409,6 +1455,7 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 
 	moorechip->serdev = serdev;
 	mutex_init(&moorechip->lock);
+	spin_lock_init(&moorechip->power_state_lock);
 	INIT_WORK(&moorechip->power_work, moorechip_power_work);
 	moorechip->panel_on[0] = true;
 	moorechip->panel_on[1] = false;
@@ -1566,18 +1613,21 @@ static int moorechip_joystick_probe(struct serdev_device *serdev)
 	ret = moorechip_register_panel_notifier(moorechip);
 	if (ret)
 		goto err_destroy_class_device;
+
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
 	moorechip->panel_on[1] = !!moorechip->notifier_cookie_sec;
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
 
 	mutex_lock(&moorechip->lock);
-	ret = moorechip_joystick_power_on_locked(moorechip);
+	ret = moorechip_apply_power_state_locked(moorechip);
 	mutex_unlock(&moorechip->lock);
 	if (ret)
-		goto err_unregister_notifier;
+		goto err_stop_power_work;
 
 	return 0;
 
-err_unregister_notifier:
-	moorechip_unregister_panel_notifiers(moorechip);
+err_stop_power_work:
+	moorechip_stop_power_work(moorechip);
 err_destroy_class_device:
 	device_destroy(moorechip->class, 0);
 err_destroy_class:
@@ -1592,16 +1642,7 @@ static void moorechip_joystick_remove(struct serdev_device *serdev)
 {
 	struct moorechip_driver *moorechip = serdev_device_get_drvdata(serdev);
 
-	cancel_work_sync(&moorechip->power_work);
-
-	mutex_lock(&moorechip->lock);
-	moorechip->panel_on[0] = false;
-	moorechip->panel_on[1] = false;
-	moorechip->system_suspended = true;
-	moorechip_joystick_power_off_locked(moorechip);
-	mutex_unlock(&moorechip->lock);
-
-	moorechip_unregister_panel_notifiers(moorechip);
+	moorechip_stop_power_work(moorechip);
 
 	if (moorechip->class) {
 		device_destroy(moorechip->class, 0);
@@ -1612,11 +1653,15 @@ static void moorechip_joystick_remove(struct serdev_device *serdev)
 static int __maybe_unused moorechip_joystick_suspend(struct device *dev)
 {
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
+	moorechip->system_suspended = true;
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
 
 	cancel_work_sync(&moorechip->power_work);
 
 	mutex_lock(&moorechip->lock);
-	moorechip->system_suspended = true;
 	moorechip_joystick_power_off_locked(moorechip);
 	mutex_unlock(&moorechip->lock);
 
@@ -1626,14 +1671,15 @@ static int __maybe_unused moorechip_joystick_suspend(struct device *dev)
 static int __maybe_unused moorechip_joystick_resume(struct device *dev)
 {
 	struct moorechip_driver *moorechip = dev_get_drvdata(dev);
-	int ret;
+	unsigned long flags;
 
-	mutex_lock(&moorechip->lock);
+	spin_lock_irqsave(&moorechip->power_state_lock, flags);
 	moorechip->system_suspended = false;
-	ret = moorechip_joystick_power_on_locked(moorechip);
-	mutex_unlock(&moorechip->lock);
+	if (!moorechip->stopping)
+		schedule_work(&moorechip->power_work);
+	spin_unlock_irqrestore(&moorechip->power_state_lock, flags);
 
-	return ret;
+	return 0;
 }
 
 #ifdef CONFIG_OF
